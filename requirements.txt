@@ -1,0 +1,17 @@
+# OCR service dependencies (Python 3.13 / Windows, CPU inference)
+# NOTE: rapidocr declares onnxruntime as an OPTIONAL engine, so it MUST be
+# listed here explicitly, otherwise inference fails with
+# "ImportError: onnxruntime is not installed."
+onnxruntime>=1.20
+rapidocr>=3.9,<4
+
+# HTTP API
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+pydantic>=2
+
+# image handling
+requests>=2.31
+pillow>=10
+numpy>=1.26
