@@ -1,9 +1,11 @@
 # OCR Service
 
-基于 **RapidOCR PP-OCRv6**（本地 ONNX，CPU 推理，模型随 pip 包自带、完全离线）的图片文字识别 HTTP 服务。
+基于 **RapidOCR PP-OCRv6**（本地 ONNX，**GPU / CUDA 推理**，模型随 pip 包自带、完全离线）的图片文字识别 HTTP 服务。
 引擎层移植自 Amazon 上品链路的 `ocr_engines.py` / `OCRProcessor`，保留超时保护、首次推理预热、串行化推理、可恢复熔断。
 
 - **对外端口：`6575`**（监听 `0.0.0.0`，`PORT` 环境变量可改）
+- **默认 8 个 worker**（`WORKERS`），每个 worker 独立 ONNX session + 推理锁 → 有效并发 8
+- **GPU：CUDA 12 + cuDNN 9**（`onnxruntime-gpu==1.26.0`），启动时强校验，绝不允许静默回退 CPU
 - 本机：`http://127.0.0.1:6575` ｜ 同 WiFi 笔记本：`http://192.168.1.14:6575`
 - 在线接口文档：`http://127.0.0.1:6575/docs`
 
@@ -71,7 +73,8 @@
 ## 2. 启动 / 停止
 
 ```bat
-:: 双击 start_service.bat，或在项目根目录执行
+:: 双击 start_service.bat（默认 8 worker / CUDA），或在项目根目录执行
+set WORKERS=8
 .venv\Scripts\python.exe server.py
 ```
 
@@ -82,13 +85,23 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://repo.huaweicloud.com/repository/pypi/simple
 ```
 
-停止：在服务窗口按 `Ctrl+C`。服务单进程单 worker，模型只加载一份。
+> **依赖版本必须匹配本机 CUDA**：`onnxruntime-gpu==1.26.0` 对应 CUDA 12 + cuDNN 9；
+> `1.31.x` 对应 CUDA 13。本机 CUDA 12.4 / cuDNN 9 的 DLL 由 RMBG 项目的 PyTorch wheel
+> 提供，`ocr_service/runtime_env.py` 会自动把它加入 DLL 搜索路径。
+> **不要同时安装 CPU 版 `onnxruntime`**，两个包会互相覆盖。
+
+停止：在服务窗口按 `Ctrl+C`（会一并结束 8 个 worker 子进程）。
 
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `PORT` / `HOST` | `6575` / `0.0.0.0` | 监听地址 |
+| `WORKERS` | `8` | worker 进程数 = OCR 有效并发数；也接受 `WEB_CONCURRENCY` |
+| `OCR_EP` | `cuda` | `cuda`（CUDA）/ `dml`（DirectML）/ `cpu`（需配合 `OCR_REQUIRE_GPU=0`） |
+| `OCR_REQUIRE_GPU` | `1` | 为 `1` 时 GPU 不可用直接启动失败，且引擎创建后校验真实 session provider |
+| `OCR_GPU_DEVICE_ID` | `0` | CUDA / DML 设备号 |
+| `OCR_CUDA_DLL_DIR` | 自动探测 | 手动指定 CUDA DLL 目录，多个用 `;` 分隔 |
 | `AMAZON_OCR_DETAIL_TEXT_MODEL` | `0` | 全局默认是否启用高精度模型 |
 | `AMAZON_OCR_ENGINE_TIMEOUT_SECONDS` | `15` | 单图推理超时 |
 | `AMAZON_OCR_LOCK_WAIT_SECONDS` | `5` | 推理锁等待 |

@@ -41,13 +41,18 @@ logger = logging.getLogger("ocr-service")
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "6575"))
+# Each worker owns one ONNX session set and one inference lock, so effective
+# OCR concurrency == worker count. Eight workers by default.
+WORKERS = max(1, int(os.getenv("WORKERS", os.getenv("WEB_CONCURRENCY", "8"))))
 MAX_UPLOAD_BYTES = int(os.getenv("OCR_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 REQUEST_LOCK_TIMEOUT = float(os.getenv("OCR_REQUEST_LOCK_TIMEOUT", "200"))
+PREWARM = os.getenv("OCR_PREWARM", "1").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 processor = OCRProcessor()
-# Native OCR is single-threaded and the processor exposes last_* state, so
-# serialize whole requests instead of letting concurrent callers fight for the
-# inference lease and overwrite each other's metadata.
+# Native ONNX sessions are not safe for concurrent inference inside a process.
+# Multiple workers are separate processes, each with its own session + lock.
 _request_lock = threading.Lock()
 
 app = FastAPI(
@@ -142,8 +147,10 @@ def _do_ocr(
 def root():
     return {
         "service": "OCR Service",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "port": PORT,
+        "workers": WORKERS,
+        "ep": ocr_status()["ep"],
         "endpoints": ["/health", "/sample.png", "/ocr", "/ocr/upload", "/ocr/reset", "/docs"],
     }
 
@@ -158,6 +165,8 @@ def health():
             "detail_engine_ready": processor.ocr is not None,
             "detail_model_enabled": processor.detail_model_enabled,
             "port": PORT,
+            "workers": WORKERS,
+            "pid": os.getpid(),
         }
     )
     return status
@@ -217,22 +226,29 @@ def ocr_reset():
 
 @app.on_event("startup")
 def _startup():
-    def _warm():
-        logger.info("Warming up presence OCR engine in background ...")
-        processor.warm_up()
+    if PREWARM:
+        def _warm():
+            logger.info("Warming up presence OCR engine in background ...")
+            processor.warm_up()
 
-    threading.Thread(target=_warm, name="ocr-prewarm", daemon=True).start()
-    logger.info("OCR service listening on %s:%s", HOST, PORT)
+        threading.Thread(target=_warm, name="ocr-prewarm", daemon=True).start()
+    logger.info(
+        "OCR worker pid=%s listening on %s:%s (workers=%s)",
+        os.getpid(), HOST, PORT, WORKERS,
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
 
+    # Windows spawns worker processes, which must be able to import the app by
+    # name; passing the ``app`` object is rejected when workers > 1.
+    app_target = "server:app" if WORKERS > 1 else app
     uvicorn.run(
-        app,
+        app_target,
         host=HOST,
         port=PORT,
-        workers=1,
+        workers=WORKERS,
         reload=False,
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
     )

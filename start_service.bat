@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
-REM Start the OCR service on 0.0.0.0:6575 (override with PORT/HOST env vars).
+REM Start the OCR service (GPU / CUDA, 8 workers) on 0.0.0.0:6575.
+REM Override with PORT / HOST / WORKERS / OCR_EP env vars before launching.
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
@@ -13,6 +14,8 @@ if not exist ".venv\Scripts\python.exe" (
 
 if "%PORT%"=="" set PORT=6575
 if "%HOST%"=="" set HOST=0.0.0.0
-echo OCR service starting at http://%HOST%:%PORT%  (docs: /docs)
+if "%WORKERS%"=="" set WORKERS=8
+if "%OCR_EP%"=="" set OCR_EP=cuda
+echo OCR service starting at http://%HOST%:%PORT%  (workers=%WORKERS%, ep=%OCR_EP%, docs: /docs)
 ".venv\Scripts\python.exe" server.py
 pause

@@ -1,8 +1,15 @@
-# OCR service dependencies (Python 3.13 / Windows, CPU inference)
-# NOTE: rapidocr declares onnxruntime as an OPTIONAL engine, so it MUST be
-# listed here explicitly, otherwise inference fails with
-# "ImportError: onnxruntime is not installed."
-onnxruntime>=1.20
+# OCR service dependencies (Python 3.13 / Windows, CUDA GPU inference)
+#
+# IMPORTANT: onnxruntime-gpu version must match the installed CUDA runtime.
+#   1.26.0 -> CUDA 12.x + cuDNN 9  (cublas64_12.dll, cudart64_12.dll,
+#                                   cudnn64_9.dll, cufft64_11.dll)
+#   1.31.x -> CUDA 13.x + cuDNN 9  (cublasLt64_13.dll ...)
+# This machine has CUDA 12.4 / cuDNN 9 DLLs bundled with the RMBG PyTorch wheel,
+# so 1.26.0 is pinned. Do NOT also install the CPU-only `onnxruntime` package:
+# the two packages provide the same module and would shadow each other.
+# For DirectML instead, replace this line with `onnxruntime-directml` and set
+# OCR_EP=dml (no CUDA DLLs required).
+onnxruntime-gpu==1.26.0
 rapidocr>=3.9,<4
 
 # HTTP API

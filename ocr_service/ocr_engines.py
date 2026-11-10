@@ -20,6 +20,13 @@ from PIL import Image
 from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 
 from .image_assets import get_image_asset, load_image as load_shared_image
+from .init_lock import gpu_init_lock
+from .runtime_env import (
+    REQUIRE_GPU,
+    engine_params,
+    expected_provider,
+    runtime_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +101,59 @@ class OCRBusyError(TimeoutError):
     """Raised when another OCR call owns the process-local inference lease."""
 
 
+# Filled in when an engine is created; exposed through /health so a silent
+# ONNX Runtime CPU fallback can never masquerade as GPU inference.
+_GPU_SESSION_PROVIDERS: dict[str, list[str]] = {}
+
+
+def _session_providers(engine: Any) -> dict[str, list[str]]:
+    """Read the *actual* providers of each RapidOCR ONNX session."""
+    found: dict[str, list[str]] = {}
+    for name in ("text_det", "text_cls", "text_rec", "det", "cls", "rec"):
+        part = getattr(engine, name, None)
+        if part is None:
+            continue
+        holder = getattr(part, "session", None)
+        session = getattr(holder, "session", None) or holder
+        getter = getattr(session, "get_providers", None)
+        if callable(getter):
+            try:
+                found[name] = list(getter())
+            except Exception:
+                continue
+    return found
+
+
+def _assert_engine_on_gpu(engine: Any, label: str) -> dict[str, list[str]]:
+    """Fail loudly when the CUDA/DML provider was requested but not used."""
+    global _GPU_SESSION_PROVIDERS
+    providers = _session_providers(engine)
+    if providers:
+        _GPU_SESSION_PROVIDERS = providers
+
+    wanted = expected_provider()
+    if wanted is None or not REQUIRE_GPU:
+        return providers
+    if not providers:
+        if REQUIRE_GPU and wanted:
+            raise RuntimeError(
+                f"GPU inference is required but {label} exposed no ONNX sessions. "
+                f"The engine failed to initialize (check CUDA DLLs / commit memory)."
+            )
+        logger.warning("OCR %s: cannot introspect session providers", label)
+        return providers
+
+    fallback = {k: v for k, v in providers.items() if not v or v[0] != wanted}
+    if fallback:
+        raise RuntimeError(
+            f"GPU inference is required but {label} sessions fell back to CPU: "
+            f"{fallback}. Check the CUDA runtime DLLs (OCR_CUDA_DLL_DIR) "
+            f"and the onnxruntime-gpu / CUDA version match."
+        )
+    logger.info("OCR %s engine running on %s: %s", label, wanted, providers)
+    return providers
+
+
 def _is_fatal_ocr_error(exc: BaseException) -> bool:
     message = str(exc or "").lower()
     return isinstance(exc, MemoryError) or any(
@@ -113,6 +173,15 @@ def ensure_ocr_process_owner() -> bool:
 
 
 def _initialize_engine(factory, label: str):
+    """Serialize the one-off CUDA session creation across worker processes.
+
+    Inference itself is NOT serialized; each worker keeps its own engine.
+    """
+    with gpu_init_lock():
+        return _initialize_engine_unlocked(factory, label)
+
+
+def _initialize_engine_unlocked(factory, label: str):
     if _ocr_is_currently_disabled():
         raise OCRTimeoutError("local OCR is disabled after an earlier fatal error")
     if not ensure_ocr_process_owner():
@@ -154,7 +223,14 @@ def _initialize_engine(factory, label: str):
             if value is None:
                 raise RuntimeError(f"OCR {label} factory returned no engine")
             _mark_warmup_window()
+            # RapidOCR creates its ONNX sessions lazily on the first inference,
+            # so the real execution providers only exist after warm-up.
             warm_up_engine(value)
+            try:
+                _assert_engine_on_gpu(value, label)
+            except RuntimeError:
+                _ocr_mark_disabled()
+                raise
             return value
         if _is_fatal_ocr_error(value):
             _ocr_mark_disabled()
@@ -225,12 +301,12 @@ def create_text_presence_ocr():
 
 @lru_cache(maxsize=1)
 def _create_text_presence_ocr():
-    return RapidOCR(params={
+    return RapidOCR(params=engine_params({
         "Rec.ocr_version": OCRVersion.PPOCRV6,
         "Rec.lang_type": LangRec.CH,
         "Rec.model_type": ModelType.SMALL,
         "Rec.batch_num": 1,
-    })
+    }))
 
 
 def create_ai_text_ocr():
@@ -245,12 +321,12 @@ def _create_ai_text_ocr():
         return paddle
 
     logger.warning("PaddleOCR unavailable; falling back to RapidOCR PP-OCRv6 medium")
-    return RapidOCR(params={
+    return RapidOCR(params=engine_params({
         "Rec.ocr_version": OCRVersion.PPOCRV6,
         "Rec.lang_type": LangRec.CH,
         "Rec.model_type": ModelType.MEDIUM,
         "Rec.batch_num": 1,
-    })
+    }))
 
 
 def _create_paddle_ocr():
@@ -580,6 +656,12 @@ def filter_text_pairs(
 
 def ocr_status() -> dict:
     """Runtime status of the process-local circuit breaker (for /health)."""
+    info = runtime_info()
+    wanted = expected_provider()
+    sessions = _GPU_SESSION_PROVIDERS
+    gpu_ready = bool(wanted and sessions and all(
+        providers and providers[0] == wanted for providers in sessions.values()
+    ))
     return {
         "local_ocr_disabled": _ocr_is_currently_disabled(),
         "cooldown_remaining_seconds": round(max(0.0, _OCR_DISABLED_UNTIL - time.monotonic()), 1),
@@ -587,6 +669,13 @@ def ocr_status() -> dict:
         "engine_timeout_seconds": _OCR_ENGINE_TIMEOUT_SECONDS,
         "initialization_timeout_seconds": _OCR_INITIALIZATION_TIMEOUT_SECONDS,
         "max_image_side": _OCR_MAX_IMAGE_SIDE,
+        "ep": info["ep"],
+        "ort_version": info["ort_version"],
+        "ort_device": info["ort_device"],
+        "available_providers": info["available_providers"],
+        "session_providers": sessions,
+        "gpu_ready": gpu_ready,
+        "gpu_device_id": info["gpu_device_id"],
     }
 
 
