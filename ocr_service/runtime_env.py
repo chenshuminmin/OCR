@@ -184,7 +184,7 @@ def engine_params(base: dict[str, Any]) -> dict[str, Any]:
         # GPU itself still had >11GB free. 2GB per arena is a safe ceiling
         # for 4 workers on a 16GB GPU.
         params["EngineConfig.onnxruntime.cuda_ep_cfg.gpu_mem_limit"] = (
-            int(os.getenv("OCR_GPU_MEM_LIMIT_MB", "2048")) * 1024 * 1024
+            int(os.getenv("OCR_GPU_MEM_LIMIT_MB", "4096")) * 1024 * 1024
         )
         params["EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_use_max_workspace"] = 0
     elif EP == "dml":

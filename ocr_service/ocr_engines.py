@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 from functools import lru_cache
-from typing import Any, List, Tuple
+from typing import Any, Callable, List, Tuple
 
 import numpy as np
 from PIL import Image
@@ -101,6 +101,10 @@ class OCRBusyError(TimeoutError):
     """Raised when another OCR call owns the process-local inference lease."""
 
 
+class OCREngineExhaustedError(RuntimeError):
+    """Raised when the GPU memory arena is full and the engine must be rebuilt."""
+
+
 # Filled in when an engine is created; exposed through /health so a silent
 # ONNX Runtime CPU fallback can never masquerade as GPU inference.
 _GPU_SESSION_PROVIDERS: dict[str, list[str]] = {}
@@ -164,6 +168,22 @@ def _is_fatal_ocr_error(exc: BaseException) -> bool:
             "not enough memory",
             "failed to allocate",
         )
+    )
+
+
+def is_arena_exhaustion_error(exc: BaseException) -> bool:
+    """Detect ORT CUDA BFC-arena exhaustion specifically.
+
+    The BFC arena never returns memory to the GPU, so under sustained large
+    image traffic it eventually fills its cap. That failure is *transient* for
+    the process (rebuilding the engine releases everything), unlike a true
+    out-of-VRAM condition.
+    """
+    message = str(exc or "").lower()
+    return (
+        "bfc_arena" in message
+        or "allocaterawinternal" in message
+        or ("failed to allocate" in message and "arena" in message)
     )
 
 
@@ -506,6 +526,14 @@ def _run_native_ocr_with_timeout(
 
         if succeeded:
             return value
+        if is_arena_exhaustion_error(value):
+            # The arena is full but the process is healthy; raising the
+            # dedicated error lets run_ocr rebuild the engine (freeing all
+            # GPU memory) and retry, instead of returning empty results.
+            # NOTE: must run before _is_fatal_ocr_error — the "Available
+            # memory ... smaller than requested" variant contains neither
+            # "failed to allocate" nor "out of memory".
+            raise OCREngineExhaustedError(str(value)) from value
         if _is_fatal_ocr_error(value):
             _ocr_mark_disabled()
             logger.error(
@@ -527,8 +555,14 @@ def run_ocr(
     engine_timeout_seconds: float | None = None,
     timeout_seconds: float | None = None,
     lock_timeout_seconds: float | None = None,
+    on_engine_exhausted: Callable[[], Any] | None = None,
 ) -> Tuple[List[str], List[float]]:
-    """Run native OCR without allowing a hung call to stall the batch."""
+    """Run native OCR without allowing a hung call to stall the batch.
+
+    ``on_engine_exhausted`` is called when the GPU memory arena is full; it
+    must return a freshly built engine (dropping the old one releases the
+    arena), and the call is then retried instead of failing.
+    """
     if timeout_seconds is not None:
         engine_timeout_seconds = timeout_seconds
     if engine_timeout_seconds is None:
@@ -547,8 +581,10 @@ def run_ocr(
     image = _limit_image_array(image)
 
     attempts = max(1, int(ocr_timeout_retries))
+    rebuild_budget = 2 if on_engine_exhausted is not None else 0
+    attempt = 1
     last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    while True:
         try:
             result = _run_native_ocr_with_timeout(
                 engine,
@@ -559,6 +595,20 @@ def run_ocr(
             return _extract_ocr_texts(result)
         except (OCRTimeoutError, OCRBusyError):
             raise
+        except OCREngineExhaustedError as exc:
+            last_error = exc
+            if rebuild_budget <= 0:
+                raise
+            rebuild_budget -= 1
+            logger.warning(
+                "OCR GPU arena exhausted; rebuilding engine and retrying "
+                "(rebuild %s/2): %s",
+                2 - rebuild_budget,
+                exc,
+            )
+            engine = on_engine_exhausted()
+            time.sleep(0.5)
+            continue
         except Exception as exc:
             last_error = exc
             logger.warning(
@@ -567,8 +617,10 @@ def run_ocr(
                 attempts,
                 exc,
             )
-            if attempt < attempts:
-                time.sleep(0.5 * attempt)
+            if attempt >= attempts:
+                break
+            attempt += 1
+            time.sleep(0.5 * attempt)
 
     logger.error("Amazon OCR engine call failed permanently: %s", last_error)
     raise last_error or RuntimeError("Amazon OCR engine call failed")

@@ -20,6 +20,7 @@ from .image_assets import load_image
 from .ocr_engines import (
     OCRBusyError,
     OCRTimeoutError,
+    clear_ocr_engine_cache,
     create_ai_text_ocr,
     create_text_presence_ocr,
     download_image_array,
@@ -79,6 +80,22 @@ class OCRProcessor:
             logging.warning("OCR pre-warm skipped: %s", exc)
             return False
 
+    def _rebuild_presence_ocr(self):
+        """Rebuild the presence engine after GPU-arena exhaustion.
+
+        Dropping the old RapidOCR instance releases its ONNX sessions, which
+        frees the whole GPU arena; a fresh engine then starts with an empty
+        pool and the failed request is retried.
+        """
+        self.presence_ocr = None
+        clear_ocr_engine_cache()
+        return self._ensure_presence_ocr()
+
+    def _rebuild_detail_ocr(self):
+        self.ocr = None
+        clear_ocr_engine_cache()
+        return self._ensure_detail_ocr()
+
     def recognize_text(
         self,
         image,
@@ -103,7 +120,11 @@ class OCRProcessor:
 
         try:
             presence_ocr = self._ensure_presence_ocr()
-            presence_texts, presence_scores = run_ocr(presence_ocr, image)
+            presence_texts, presence_scores = run_ocr(
+                presence_ocr,
+                image,
+                on_engine_exhausted=self._rebuild_presence_ocr,
+            )
             presence_filtered, presence_filtered_scores = filter_text_pairs(
                 presence_texts, presence_scores, min_score=0.35
             )
@@ -127,7 +148,11 @@ class OCRProcessor:
 
         try:
             detail_ocr = self._ensure_detail_ocr()
-            texts, scores = run_ocr(detail_ocr, image)
+            texts, scores = run_ocr(
+                detail_ocr,
+                image,
+                on_engine_exhausted=self._rebuild_detail_ocr,
+            )
             filtered, filtered_scores = filter_text_pairs(texts, scores, min_score)
         except Exception as exc:
             self._detail_ocr_enabled = False
