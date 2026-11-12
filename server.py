@@ -55,6 +55,64 @@ processor = OCRProcessor()
 # Multiple workers are separate processes, each with its own session + lock.
 _request_lock = threading.Lock()
 
+# ORT CUDA arenas (BFC), cuDNN workspaces and pinned host buffers only grow
+# during the worker's lifetime, so commit charge creeps up until the whole
+# system runs out of virtual memory (which crashed the NVIDIA driver once).
+# Recycle the worker process when its private commit exceeds a cap; uvicorn
+# respawns dead workers automatically, so the port never goes down.
+WORKER_MAX_COMMIT_GB = float(os.getenv("OCR_WORKER_MAX_COMMIT_GB", "8"))
+MEMORY_CHECK_SECONDS = float(os.getenv("OCR_MEMORY_CHECK_SECONDS", "60"))
+
+
+def _process_private_bytes() -> int:
+    """Private (commit) bytes of the current process, via psapi."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = PROCESS_MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+    handle = ctypes.windll.kernel32.GetCurrentProcess()
+    if not ctypes.windll.psapi.GetProcessMemoryInfo(
+        handle, ctypes.byref(counters), counters.cb
+    ):
+        return 0
+    return counters.PagefileUsage
+
+
+def _memory_recycle_loop():
+    limit_bytes = WORKER_MAX_COMMIT_GB * 1024 ** 3
+    while True:
+        time.sleep(MEMORY_CHECK_SECONDS)
+        try:
+            private = _process_private_bytes()
+        except Exception:
+            continue
+        if not private or private <= limit_bytes:
+            continue
+        # Acquiring the request lock guarantees no request is mid-flight.
+        if _request_lock.acquire(timeout=30):
+            _request_lock.release()
+            logger.critical(
+                "OCR worker pid=%s private memory %.2fGB > %.2fGB cap; "
+                "recycling process (uvicorn will respawn it)",
+                os.getpid(), private / 1024 ** 3, WORKER_MAX_COMMIT_GB,
+            )
+            os._exit(0)
+
 app = FastAPI(
     title="OCR Service",
     version="1.0.0",
@@ -232,6 +290,10 @@ def _startup():
             processor.warm_up()
 
         threading.Thread(target=_warm, name="ocr-prewarm", daemon=True).start()
+    if WORKER_MAX_COMMIT_GB > 0:
+        threading.Thread(
+            target=_memory_recycle_loop, name="ocr-mem-recycle", daemon=True
+        ).start()
     logger.info(
         "OCR worker pid=%s listening on %s:%s (workers=%s)",
         os.getpid(), HOST, PORT, WORKERS,
