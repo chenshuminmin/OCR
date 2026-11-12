@@ -176,15 +176,14 @@ def engine_params(base: dict[str, Any]) -> dict[str, Any]:
         # first run and is slow / memory hungry, especially with 8 workers.
         params["EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search"] = "DEFAULT"
         params["EngineConfig.onnxruntime.cuda_ep_cfg.arena_extend_strategy"] = "kSameAsRequested"
-        # A per-arena cap keeps runaway allocations bounded, but it must be
-        # generous: the BFC arena never returns memory to CUDA, and large
-        # (~2500px) detection inputs need several hundred MB. A 512MB cap
-        # made every OCR call return empty once the arena filled up
-        # (BFCArena::AllocateRawInternal "available < requested"), while the
-        # GPU itself still had >11GB free. 2GB per arena is a safe ceiling
-        # for 4 workers on a 16GB GPU.
+        # A per-arena cap keeps runaway allocations bounded. The cap is per
+        # session (det/cls/rec each get one), so a worker can hold up to 3x
+        # this value. 4GB let 4 workers fill a 16GB GPU and starve a game
+        # running beside the service. 768MB x 3 sessions x 4 workers = 9.2GB
+        # worst case; when an arena does fill up, run_ocr rebuilds the engine
+        # and retries (self-healing), so requests no longer return empty.
         params["EngineConfig.onnxruntime.cuda_ep_cfg.gpu_mem_limit"] = (
-            int(os.getenv("OCR_GPU_MEM_LIMIT_MB", "4096")) * 1024 * 1024
+            int(os.getenv("OCR_GPU_MEM_LIMIT_MB", "768")) * 1024 * 1024
         )
         params["EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_use_max_workspace"] = 0
     elif EP == "dml":
