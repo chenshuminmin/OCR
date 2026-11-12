@@ -85,10 +85,13 @@ def _process_private_bytes() -> int:
 
     counters = PROCESS_MEMORY_COUNTERS()
     counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-    handle = ctypes.windll.kernel32.GetCurrentProcess()
-    if not ctypes.windll.psapi.GetProcessMemoryInfo(
-        handle, ctypes.byref(counters), counters.cb
-    ):
+    psapi = ctypes.WinDLL("psapi")
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD,
+    ]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(-1)  # GetCurrentProcess pseudo-handle
+    if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
         return 0
     return counters.PagefileUsage
 
